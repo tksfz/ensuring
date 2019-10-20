@@ -11,7 +11,7 @@ object Example extends IOApp {
     val ec2 = new EC2Resources(ec2Client)
     (for {
       myInstance <- ec2.ec2("ami-0c6af4325106f3667", "Name" -> "test")
-        .instanceType(InstanceType.T1_MICRO)
+        .instanceType(InstanceType.T3_MICRO)
     } yield {
       myInstance
     }).ensure.flatMap {
