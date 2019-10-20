@@ -1,25 +1,34 @@
-package org.tksf.ensuring.ec2
+package org.tksfz.ensuring.ec2
 
 import cats.effect.{ContextShift, IO}
-import org.tksf.ensuring.{Already, Ensure, State}
+import org.tksfz.ensuring.{Ensure, State}
 import software.amazon.awssdk.services.ec2.Ec2AsyncClient
-import software.amazon.awssdk.services.ec2.model.{AttributeValue, DescribeInstancesRequest, DescribeInstancesResponse, Filter, Instance, InstanceType, ModifyInstanceAttributeRequest, RunInstancesRequest}
+import software.amazon.awssdk.services.ec2.model.{AttributeValue, DescribeInstancesRequest, DescribeInstancesResponse, Ec2Exception, Filter, Instance, InstanceType, ModifyInstanceAttributeRequest, ResourceType, RunInstancesRequest, Tag, TagSpecification}
 
 import scala.jdk.CollectionConverters._
 import scala.jdk.FutureConverters._
 
 class EC2Resources(ec2Client: Ec2AsyncClient) {
-  def ec2(instanceId: String)(implicit cs: ContextShift[IO]): EC2Ensure = {
+  def ec2(imageId: String, tag: (String, String))(implicit cs: ContextShift[IO]): EC2Ensure = {
+    // TODO: ignore terminated instances
     val request = DescribeInstancesRequest.builder()
-      .instanceIds(instanceId)
+      .filters(Filter.builder().name(s"tag:${tag._1}").values(tag._2).build())
       .build()
     EC2Ensure(ec2Client,
-      RunInstancesRequest.builder(),
+      RunInstancesRequest.builder()
+        .imageId(imageId)
+        .minCount(1)
+        .maxCount(1)
+        .tagSpecifications(TagSpecification.builder()
+          .resourceType(ResourceType.INSTANCE)
+          .tags(Tag.builder().key(tag._1).value(tag._2).build()).build()),
       Ensure.find {
-        // TODO: find by tag or whatnot
         IO.fromFuture(IO(ec2Client.describeInstances(request).asScala))
           .map(_.reservations().asScala.flatMap(_.instances.asScala).headOption)
       }
+        .subcondition { i =>
+          Ensure.equal(i.imageId(), imageId)
+        }
     )
   }
 }
