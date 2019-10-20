@@ -2,6 +2,12 @@ package org.tksfz.ensuring
 
 import cats.effect.IO
 
+/**
+  * The result of ensuring some condition may have one of three outcomes:
+  * - the condition is already applied (Already)
+  * - the condition is not applied (Except)
+  * - the condition may become applied and re-probed with some operations (TBD)
+  */
 sealed trait State[+A] {
   def map[B](f: A => B): State[B] = {
     flatMap(a => Already(f(a)))
@@ -31,19 +37,15 @@ trait Ensure[A] {
 
   def flatMap[B](f: A => Ensure[B]): Ensure[B] = new Ensure[B] {
     def ensure: IO[State[B]] = {
-      self.ensure.flatMap {
-        case Already(a) => f(a).ensure
-        case ex@Except(err) => IO.delay(ex)
-        case TBD(ioa) => ioaToIOStateB(ioa, f)
-      }
+      deepFlatMap(self.ensure, f)
     }
 
-    private def ioaToIOStateB(ioa: IO[State[A]], f: A => Ensure[B]): IO[State[B]] = {
-      IO.delay(TBD(ioa.flatMap {
+    private def deepFlatMap(ioa: IO[State[A]], f: A => Ensure[B]): IO[State[B]] = {
+      ioa.flatMap {
         case Already(a) => f(a).ensure
         case ex@Except(_) => IO.delay(ex)
-        case TBD(ioa2) => ioaToIOStateB(ioa2, f)
-      }))
+        case TBD(ioa2) => deepFlatMap(ioa2, f)
+      }
     }
   }
 
