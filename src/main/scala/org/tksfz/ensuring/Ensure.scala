@@ -1,8 +1,8 @@
-package org.tksf.ensuring
+package org.tksfz.ensuring
 
 import cats.effect.IO
 
-trait State[+A] {
+sealed trait State[+A] {
   def map[B](f: A => B): State[B] = {
     flatMap(a => Already(f(a)))
   }
