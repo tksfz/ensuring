@@ -9,7 +9,7 @@ import scala.jdk.CollectionConverters._
 import scala.jdk.FutureConverters._
 
 class EC2Resources(ec2Client: Ec2AsyncClient) {
-  def ec2(instanceId: String)(implicit cs: ContextShift[IO]): IO[Ensure[Instance]] = {
+  def ec2(instanceId: String)(implicit cs: ContextShift[IO]): Ensure[Instance] = {
     val request = DescribeInstancesRequest.builder()
       .instanceIds(instanceId)
       .build()

@@ -8,9 +8,11 @@ object Example extends IOApp {
   override def run(args: List[String]): IO[ExitCode] = {
     val ec2Client = Ec2AsyncClient.builder().build()
     val ec2 = new EC2Resources(ec2Client)
-    for {
+    (for {
       myInstance <- ec2.ec2("i-12345")
     } yield {
+      ()
+    }).ensure.map { _ =>
       ExitCode.Success
     }
   }
