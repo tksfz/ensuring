@@ -95,9 +95,12 @@ object Ensure {
     def ensure: IO[State[T]] = IO.delay(Already(t))
   }
 
-  def find[T](io: IO[T]): Ensure[T] = new Ensure[T] {
+  def find[T](io: IO[Option[T]]): Ensure[T] = new Ensure[T] {
     def ensure: IO[State[T]] = {
-      io.map(Already(_))
+      io.map {
+        case Some(t) => Already(t)
+        case None => Except("not found")
+      }
     }
   }
 }
