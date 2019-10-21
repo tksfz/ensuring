@@ -9,17 +9,23 @@ object Example extends IOApp {
   override def run(args: List[String]): IO[ExitCode] = {
     val ec2Client = Ec2AsyncClient.builder().build()
     val ec2 = new EC2Resources(ec2Client)
-    (for {
-      myInstance <- ec2.ec2("ami-0c6af4325106f3667", "Name" -> "test")
-        .instanceType(InstanceType.T3_MICRO)
+    deepRun((for {
+      myInstance <- ec2.ec2("ami-0c6af4325106f3667", args(0), "Name" -> "test")
+        .instanceType(InstanceType.T1_MICRO)
     } yield {
       myInstance
-    }).ensure.flatMap {
+    }).ensure)
+    .map { x =>
+      println(x)
+      ExitCode.Success
+    }
+  }
+
+  private def deepRun[A](f: IO[State[A]]): IO[_] = {
+    f.flatMap {
       case a@Already(t) => IO(println(a))
       case Except(err) => IO(println(err))
-      case TBD(io) => IO(println("provisioning:")).flatMap(_ => io).map(println(_))
-    }.map { _ =>
-      ExitCode.Success
+      case TBD(io) => IO(println("provisioning:")).flatMap(_ => deepRun(io))
     }
   }
 }

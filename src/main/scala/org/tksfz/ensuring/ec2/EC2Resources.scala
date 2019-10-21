@@ -3,15 +3,15 @@ package org.tksfz.ensuring.ec2
 import java.util.concurrent.CompletionException
 
 import cats.effect.{ContextShift, IO, Timer}
-import org.tksfz.ensuring.{Ensure, Except, State}
+import org.tksfz.ensuring.{Already, Ensure, Except, State}
 import software.amazon.awssdk.services.ec2.Ec2AsyncClient
-import software.amazon.awssdk.services.ec2.model.{AttributeValue, DescribeInstancesRequest, DescribeInstancesResponse, Ec2Exception, Filter, Instance, InstanceState, InstanceType, ModifyInstanceAttributeRequest, ResourceType, RunInstancesRequest, StartInstancesRequest, StopInstancesRequest, Tag, TagSpecification}
+import software.amazon.awssdk.services.ec2.model.{AttributeValue, DescribeInstancesRequest, DescribeInstancesResponse, Ec2Exception, Filter, Instance, InstanceState, InstanceType, ModifyInstanceAttributeRequest, ResourceType, RunInstancesRequest, StartInstancesRequest, StopInstancesRequest, Tag, TagSpecification, TerminateInstancesRequest}
 
 import scala.jdk.CollectionConverters._
 import scala.jdk.FutureConverters._
 
 class EC2Resources(ec2Client: Ec2AsyncClient) {
-  def ec2(imageId: String, tag: (String, String))(implicit cs: ContextShift[IO]): EC2Ensure = {
+  def ec2(imageId: String, subnetId: String, tag: (String, String))(implicit cs: ContextShift[IO], timer: Timer[IO]): EC2Ensure = {
     val request = DescribeInstancesRequest.builder()
       .filters(
         Filter.builder().name(s"tag:${tag._1}").values(tag._2).build(),
@@ -20,17 +20,16 @@ class EC2Resources(ec2Client: Ec2AsyncClient) {
       )
       .build()
     EC2Ensure(ec2Client,
+      request,
       RunInstancesRequest.builder()
         .imageId(imageId)
         .minCount(1)
         .maxCount(1)
+        .subnetId(subnetId)
         .tagSpecifications(TagSpecification.builder()
           .resourceType(ResourceType.INSTANCE)
           .tags(Tag.builder().key(tag._1).value(tag._2).build()).build()),
-      Ensure.find {
-        IO.fromFuture(IO(ec2Client.describeInstances(request).asScala))
-          .map(_.reservations().asScala.flatMap(_.instances.asScala).headOption)
-      }
+      Ensure.already(_)
         .subcondition { i =>
           Ensure.equal(i.imageId(), imageId)
         }
@@ -42,24 +41,58 @@ class EC2Resources(ec2Client: Ec2AsyncClient) {
   * @param ec2Client TODO this may end up getting pushed down into Kleisli
   * @param rir the RunInstancesRequest to use on recovery: Accumulates instance options (instance type, etc.)
   */
-case class EC2Ensure(ec2Client: Ec2AsyncClient, rir: RunInstancesRequest.Builder, ens: Ensure[Instance])(implicit cs: ContextShift[IO]) extends Ensure[Instance] {
+case class EC2Ensure(ec2Client: Ec2AsyncClient, request: DescribeInstancesRequest, rir: RunInstancesRequest.Builder, setup: Instance => Ensure[Instance])
+                    (implicit cs: ContextShift[IO], timer: Timer[IO]) extends Ensure[Instance] {
   def ensure: IO[State[Instance]] = {
-    ens
-      .recover {
-        // TODO: instanceId can't be our param because the creation below won't produce the "desired" instanceId
-        IO.fromFuture(IO(ec2Client.runInstances(rir.build()).asScala))
-          .map(_.instances().asScala.head)
+    val initial =
+      Ensure.find {
+        IO.fromFuture(IO(ec2Client.describeInstances(request).asScala))
+          .map(_.reservations().asScala.flatMap(_.instances.asScala).headOption)
       }
-      .ensure
+        .recover {
+          IO.fromFuture(IO(ec2Client.runInstances(rir.build()).asScala))
+            .map(_.instances().asScala.head)
+          // TODO: consider waiting for started
+        }
+
+    /**
+      * This recursive structure is only needed because
+      * we want recoverWith to have access to the Instance i
+      * to terminate the instance. So recoverWith is nested
+      * inside the flatMap.
+      */
+    def beginningToEnd: Ensure[Instance] = {
+      initial.flatMap { i =>
+        setup(i)
+          .log()
+          .recoverWith {
+            // If setup fails then terminate and go back to the beginning
+            Ensure.lift(
+              for {
+                _ <- IO.fromFuture(IO {
+                  println("terminating")
+                  ec2Client.terminateInstances(TerminateInstancesRequest.builder()
+                    .instanceIds(i.instanceId)
+                    .build()).asScala
+                })
+                _ <- waitForState(i.instanceId, "terminated")
+              } yield {
+                ()
+              }
+            )
+              .flatMap { _ => beginningToEnd }
+          }
+      }
+    }
+    beginningToEnd.ensure
   }
 
-  def instanceType(instanceType: InstanceType)(implicit timer: Timer[IO]): Ensure[Instance] = {
-    EC2Ensure(
-      ec2Client,
-      rir.instanceType(instanceType),
-      ens.subcondition { t =>
+  def instanceType(instanceType: InstanceType)(implicit timer: Timer[IO]): EC2Ensure = {
+    this.copy(
+      rir = rir.instanceType(instanceType),
+      setup = setup(_).subcondition { t =>
         Ensure.equal(t.instanceType(), instanceType)
-          .recover {
+          .recoverWith {
             for {
               _ <- IO.fromFuture(IO {
                 val req = StopInstancesRequest.builder()
@@ -77,26 +110,26 @@ case class EC2Ensure(ec2Client: Ec2AsyncClient, rir: RunInstancesRequest.Builder
                   .build()
                 ec2Client.modifyInstanceAttribute(miar).asScala
               })
-              _ <- IO.fromFuture(IO(ec2Client.startInstances(
+              x <- IO.fromFuture(IO(ec2Client.startInstances(
                   StartInstancesRequest.builder()
                     .instanceIds(t.instanceId)
                     .build()
                 ).asScala
               ))
-                  .handleErrorWith { x =>
-                    IO(println("ih")).flatMap{ _ =>
-                    x match {
+                  .map(_ => Already(instanceType))
+                  .handleErrorWith {
+                    // This no longer repros but can be simulated by forcing an Except
                     case e: CompletionException => e.getCause match {
                       case e: Ec2Exception if e.statusCode() == 400 =>
-                        IO(println("got error")).flatMap{ _ =>
+                        IO { println(s"got error"); e.printStackTrace() }.flatMap{ _ =>
                         IO.delay(Except("instance can't be started, destroying and reprovisioning"))
                         }
-                    }}
+                    }
                   }
-                  }
+                  //.map(_ => Except("fake"))
             } yield {
               // TODO fetch the newly provisioned instance type?
-              instanceType
+              x
             }
           }
       },
@@ -112,8 +145,11 @@ case class EC2Ensure(ec2Client: Ec2AsyncClient, rir: RunInstancesRequest.Builder
     })
       .flatMap { resp =>
         val i = resp.reservations().asScala.flatMap(_.instances.asScala).head
-        if (i.state().nameAsString() == state) {
+        val current = i.state().nameAsString()
+        if (current == state) {
           IO.unit
+        } else if (current == "terminated") {
+          IO.raiseError(new IllegalStateException("terminated"))
         } else {
           IO(println(s"got ${i.state}")).flatMap { _ =>
           import scala.concurrent.duration._

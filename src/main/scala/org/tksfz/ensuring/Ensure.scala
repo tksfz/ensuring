@@ -71,13 +71,38 @@ trait Ensure[A] {
     }
   }
 
+  def log(): Ensure[A] = new Ensure[A] {
+    def ensure: IO[State[A]] = {
+      self.ensure.map { state =>
+        println("logging: " + state)
+        state
+      }
+    }
+  }
+
+  def recoverWith(f: Ensure[A]): Ensure[A] = new Ensure[A] {
+    def ensure: IO[State[A]] = {
+      deepRecover(self.ensure, f.ensure)
+    }
+  }
+
+  def recoverWith(f: IO[State[A]]): Ensure[A] = new Ensure[A] {
+    def ensure: IO[State[A]] = {
+      deepRecover(self.ensure, f)
+    }
+  }
+
+  private def deepRecover(io: IO[State[A]], f: IO[State[A]]): IO[State[A]] = {
+    io.flatMap {
+      case a@Already(_) => IO.delay(a)
+      case Except(err) => f
+      case TBD(io2) => deepRecover(io2, f)
+    }
+  }
+
   def recover(f: IO[A]): Ensure[A] = new Ensure[A] {
     def ensure: IO[State[A]] = {
-      self.ensure.map {
-        case a@Already(_) => a
-        case tbd@TBD(_) => tbd
-        case Except(err) => TBD(f.map(Already(_)))
-      }
+      deepRecover(self.ensure, f.map(Already(_)))
     }
   }
 }
@@ -95,6 +120,10 @@ object Ensure {
 
   def already[T](t: T): Ensure[T] = new Ensure[T] {
     def ensure: IO[State[T]] = IO.delay(Already(t))
+  }
+
+  def lift[T](f: IO[T]): Ensure[T] = new Ensure[T] {
+    def ensure: IO[State[T]] = f.map(Already(_))
   }
 
   def find[T](io: IO[Option[T]]): Ensure[T] = new Ensure[T] {
