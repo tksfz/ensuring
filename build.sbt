@@ -3,8 +3,8 @@ import Dependencies._
 inThisBuild(List(
   scalaVersion     := "2.13.1",
   version          := "0.1.0-SNAPSHOT",
-  organization     := "com.example",
-  organizationName := "example",
+  organization     := "org.tksfz",
+  organizationName := "Tksfz",
   homepage := Some(url("https://github.com/tksfz/ensuring")),
   licenses := List("Apache-2.0" -> url("http://www.apache.org/licenses/LICENSE-2.0")),
   developers := List(
