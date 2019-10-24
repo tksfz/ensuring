@@ -6,21 +6,11 @@ import cats.effect.IO
   * The result of ensuring some condition may have one of three outcomes:
   * - the condition is already applied (Already)
   * - the condition is not applied (Except)
-  * - the condition may become applied and re-probed with some operations (TBD)
+  * - the condition may be applied and re-probed using an update operation (TBD)
   */
-sealed trait State[+A] {
-  def map[B](f: A => B): State[B] = {
-    flatMap(a => Already(f(a)))
-  }
-
-  def flatMap[B](f: A => State[B]): State[B] = this match {
-    case Already(a) => f(a)
-    case ex@Except(_) => ex
-    case TBD(op) => TBD(op.map(_.flatMap(f)))
-  }
-}
+sealed trait State[+A]
 case class Already[A](value: A) extends State[A]
-case class TBD[A](op: IO[State[A]]) extends State[A]
+case class TBD[A](triggeredBy: State[_], update: IO[State[A]]) extends State[A]
 case class Except(err: String) extends State[Nothing]
 
 trait Ensure[A] {
@@ -44,7 +34,9 @@ trait Ensure[A] {
       ioa.flatMap {
         case Already(a) => f(a).ensure
         case ex@Except(_) => IO.delay(ex)
-        case TBD(ioa2) => deepFlatMap(ioa2, f)
+        case TBD(t, ioa2) => if (Ensure.planMode) {
+          IO.delay(TBD(t, deepFlatMap(ioa2, f)))
+        } else deepFlatMap(ioa2, f)
       }
     }
   }
@@ -61,10 +53,10 @@ trait Ensure[A] {
     def ensure: IO[State[A]] = {
       self.ensure.map {
         case a@Already(_) => a
-        case Except(msg) =>
+        case ex@Except(msg) =>
           // destroy then restart
-          TBD(destroy.flatMap(_ => self.ensure))
-        case a@TBD(ioa) =>
+          TBD(ex, destroy.flatMap(_ => self.ensure))
+        case a@TBD(_, ioa) =>
           // chain the destroy and restart? infinitely?
           a
       }
@@ -95,8 +87,8 @@ trait Ensure[A] {
   private def deepRecover(io: IO[State[A]], f: IO[State[A]]): IO[State[A]] = {
     io.flatMap {
       case a@Already(_) => IO.delay(a)
-      case Except(err) => f
-      case TBD(io2) => deepRecover(io2, f)
+      case ex@Except(err) => if (Ensure.planMode) IO.delay(TBD(ex, f)) else f
+      case tbd@TBD(t, io2) => if (Ensure.planMode) IO.delay(tbd) else deepRecover(io2, f)
     }
   }
 
@@ -108,6 +100,10 @@ trait Ensure[A] {
 }
 
 object Ensure {
+
+  // Obviously temporary
+  val planMode = true
+
   def equal[T](a: => T, b: => T): Ensure[T] = new Ensure[T] {
     def ensure: IO[State[T]] = IO.delay {
       if (a == b) {
