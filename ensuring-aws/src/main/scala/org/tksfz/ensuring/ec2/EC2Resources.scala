@@ -29,7 +29,7 @@ class EC2Resources(ec2Client: Ec2AsyncClient) {
         .tagSpecifications(TagSpecification.builder()
           .resourceType(ResourceType.INSTANCE)
           .tags(Tag.builder().key(tag._1).value(tag._2).build()).build()),
-      Ensure.already(_)
+      Ensure.already[IO, Instance](_)
         .subcondition { i =>
           Ensure.equal(i.imageId(), imageId)
         }
@@ -41,18 +41,20 @@ class EC2Resources(ec2Client: Ec2AsyncClient) {
   * @param ec2Client TODO this may end up getting pushed down into Kleisli
   * @param rir the RunInstancesRequest to use on recovery: Accumulates instance options (instance type, etc.)
   */
-case class EC2Ensure(ec2Client: Ec2AsyncClient, request: DescribeInstancesRequest, rir: RunInstancesRequest.Builder, setup: Instance => Ensure[Instance])
-                    (implicit cs: ContextShift[IO], timer: Timer[IO]) extends Ensure[Instance] {
-  def ensure: IO[State[Instance]] = {
-    val initial =
+case class EC2Ensure(ec2Client: Ec2AsyncClient, request: DescribeInstancesRequest, rir: RunInstancesRequest.Builder,
+                     setup: Instance => Ensure[IO, Instance])
+                    (implicit cs: ContextShift[IO], timer: Timer[IO]) extends Ensure[IO, Instance] {
+  def ensure: IO[State[IO, Instance]] = {
+    val initial: Ensure[IO, Instance] =
       Ensure.find {
         IO.fromFuture(IO(ec2Client.describeInstances(request).asScala))
           .map(_.reservations().asScala.flatMap(_.instances.asScala).headOption)
       }
-        .recover {
+        .recoverWithDefault {
           IO.fromFuture(IO(ec2Client.runInstances(rir.build()).asScala))
             .map(_.instances().asScala.head)
           // TODO: consider waiting for started
+          // This should probably restart thhe Ensure too
         }
 
     /**
@@ -60,8 +62,11 @@ case class EC2Ensure(ec2Client: Ec2AsyncClient, request: DescribeInstancesReques
       * we want recoverWith to have access to the Instance i
       * to terminate the instance. So recoverWith is nested
       * inside the flatMap.
+      *
+      * TODO: I think this might be bracket:
+      * initial.bracket(destroy) { setup }
       */
-    def beginningToEnd: Ensure[Instance] = {
+    def beginningToEnd: Ensure[IO, Instance] = {
       initial.flatMap { i =>
         setup(i)
           .log()
@@ -91,8 +96,8 @@ case class EC2Ensure(ec2Client: Ec2AsyncClient, request: DescribeInstancesReques
     this.copy(
       rir = rir.instanceType(instanceType),
       setup = setup(_).subcondition { t =>
-        Ensure.equal(t.instanceType(), instanceType)
-          .recoverWith {
+        Ensure.equal[IO, InstanceType](t.instanceType(), instanceType)
+          .recoverWithF {
             for {
               _ <- IO.fromFuture(IO {
                 val req = StopInstancesRequest.builder()
@@ -116,8 +121,8 @@ case class EC2Ensure(ec2Client: Ec2AsyncClient, request: DescribeInstancesReques
                     .build()
                 ).asScala
               ))
-                  .map(_ => Already(instanceType))
-                  .handleErrorWith {
+                  .map[State[IO, InstanceType]](_ => Already(instanceType))
+                  .handleErrorWith[State[IO, InstanceType]] {
                     // This no longer repros but can be simulated by forcing an Except
                     case e: CompletionException => e.getCause match {
                       case e: Ec2Exception if e.statusCode() == 400 =>

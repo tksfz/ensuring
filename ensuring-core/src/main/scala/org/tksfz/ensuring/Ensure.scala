@@ -1,6 +1,6 @@
 package org.tksfz.ensuring
 
-import cats.effect.IO
+import cats.Monad
 
 /**
   * The result of ensuring some condition may have one of three outcomes:
@@ -8,34 +8,36 @@ import cats.effect.IO
   * - the condition is not applied (Except)
   * - the condition may be applied and re-probed using an update operation (TBD)
   */
-sealed trait State[+A]
-case class Already[A](value: A) extends State[A]
-case class TBD[A](triggeredBy: State[_], update: IO[State[A]]) extends State[A]
-case class Except(err: String) extends State[Nothing]
+sealed trait State[F[_], +A]
+case class Already[F[_], A](value: A) extends State[F, A]
+case class TBD[F[_], A](triggeredBy: State[F, _], update: F[State[F, A]]) extends State[F, A]
+case class Except[F[_]](err: String) extends State[F, Nothing]
 
-trait Ensure[A] {
+abstract class Ensure[F[_], A](implicit F: Monad[F]) {
   self =>
+
+  import cats.implicits._
 
   /**
     * Restartable ensure operation
     */
-  def ensure: IO[State[A]]
+  def ensure: F[State[F, A]]
 
-  def map[B](f: A => B): Ensure[B] = {
+  def map[B](f: A => B): Ensure[F, B] = {
     flatMap(a => Ensure.already(f(a)))
   }
 
-  def flatMap[B](f: A => Ensure[B]): Ensure[B] = new Ensure[B] {
-    def ensure: IO[State[B]] = {
+  def flatMap[B](f: A => Ensure[F, B]): Ensure[F, B] = new Ensure[F, B] {
+    def ensure: F[State[F, B]] = {
       deepFlatMap(self.ensure, f)
     }
 
-    private def deepFlatMap(ioa: IO[State[A]], f: A => Ensure[B]): IO[State[B]] = {
+    private def deepFlatMap(ioa: F[State[F, A]], f: A => Ensure[F, B]): F[State[F, B]] = {
       ioa.flatMap {
         case Already(a) => f(a).ensure
-        case ex@Except(_) => IO.delay(ex)
+        case ex@Except(_) => F.pure(ex)
         case TBD(t, ioa2) => if (Ensure.planMode) {
-          IO.delay(TBD(t, deepFlatMap(ioa2, f)))
+          F.pure(TBD(t, deepFlatMap(ioa2, f)))
         } else deepFlatMap(ioa2, f)
       }
     }
@@ -45,12 +47,12 @@ trait Ensure[A] {
     * Almost like flatTap, but reruns (restarts) this Ensure, on the premise
     * that the subcondition may affect our output
     */
-  def subcondition[B](f: A => Ensure[B]): Ensure[A] = {
+  def subcondition[B](f: A => Ensure[F, B]): Ensure[F, A] = {
     flatMap(a => f(a).flatMap(_ => self))
   }
 
-  def recoverWithDestroyAndRestart(destroy: IO[Unit]): Ensure[A] = new Ensure[A] {
-    def ensure: IO[State[A]] = {
+  def recoverWithDestroyAndRestart(destroy: F[Unit]): Ensure[F, A] = new Ensure[F, A] {
+    def ensure: F[State[F, A]] = {
       self.ensure.map {
         case a@Already(_) => a
         case ex@Except(msg) =>
@@ -63,8 +65,8 @@ trait Ensure[A] {
     }
   }
 
-  def log(): Ensure[A] = new Ensure[A] {
-    def ensure: IO[State[A]] = {
+  def log(): Ensure[F, A] = new Ensure[F, A] {
+    def ensure: F[State[F, A]] = {
       self.ensure.map { state =>
         println("logging: " + state)
         state
@@ -72,40 +74,38 @@ trait Ensure[A] {
     }
   }
 
-  def recoverWith(f: Ensure[A]): Ensure[A] = new Ensure[A] {
-    def ensure: IO[State[A]] = {
-      deepRecover(self.ensure, f.ensure)
-    }
+  // TODO: introduce E and make f: E => Ensure[F, A]
+  def recoverWith(f: Ensure[F, A]): Ensure[F, A] = {
+    recoverWithF(f.ensure)
   }
 
-  def recoverWith(f: IO[State[A]]): Ensure[A] = new Ensure[A] {
-    def ensure: IO[State[A]] = {
+  def recoverWithF(f: F[State[F, A]]): Ensure[F, A] = new Ensure[F, A] {
+    def ensure: F[State[F, A]] = {
       deepRecover(self.ensure, f)
     }
   }
 
-  private def deepRecover(io: IO[State[A]], f: IO[State[A]]): IO[State[A]] = {
+  private def deepRecover(io: F[State[F, A]], f: F[State[F, A]]): F[State[F, A]] = {
     io.flatMap {
-      case a@Already(_) => IO.delay(a)
-      case ex@Except(err) => if (Ensure.planMode) IO.delay(TBD(ex, f)) else f
-      case tbd@TBD(t, io2) => if (Ensure.planMode) IO.delay(tbd) else deepRecover(io2, f)
+      case a@Already(_) => F.pure(a)
+      case ex@Except(err) => if (Ensure.planMode) F.pure(TBD(ex, f)) else f
+      case tbd@TBD(t, io2) => if (Ensure.planMode) F.pure(tbd) else deepRecover(io2, f)
     }
   }
 
-  def recover(f: IO[A]): Ensure[A] = new Ensure[A] {
-    def ensure: IO[State[A]] = {
-      deepRecover(self.ensure, f.map(Already(_)))
-    }
+  def recoverWithDefault(f: F[A]): Ensure[F, A] = {
+    recoverWithF(f.map[State[F, A]](Already(_)))
   }
 }
 
 object Ensure {
+  import cats.implicits._
 
   // Obviously temporary
   val planMode = true
 
-  def equal[T](a: => T, b: => T): Ensure[T] = new Ensure[T] {
-    def ensure: IO[State[T]] = IO.delay {
+  def equal[F[_], T](a: => T, b: => T)(implicit F: Monad[F]): Ensure[F, T] = new Ensure[F, T] {
+    def ensure: F[State[F, T]] = F.pure {
       if (a == b) {
         Already(a)
       } else {
@@ -114,16 +114,16 @@ object Ensure {
     }
   }
 
-  def already[T](t: T): Ensure[T] = new Ensure[T] {
-    def ensure: IO[State[T]] = IO.delay(Already(t))
+  def already[F[_], T](t: T)(implicit F: Monad[F]): Ensure[F, T] = new Ensure[F, T] {
+    def ensure: F[State[F, T]] = F.pure(Already(t))
   }
 
-  def lift[T](f: IO[T]): Ensure[T] = new Ensure[T] {
-    def ensure: IO[State[T]] = f.map(Already(_))
+  def lift[F[_], T](f: F[T])(implicit F: Monad[F]): Ensure[F, T] = new Ensure[F, T] {
+    def ensure: F[State[F, T]] = f.map(Already(_))
   }
 
-  def find[T](io: IO[Option[T]]): Ensure[T] = new Ensure[T] {
-    def ensure: IO[State[T]] = {
+  def find[F[_], T](io: F[Option[T]])(implicit F: Monad[F]): Ensure[F, T] = new Ensure[F, T] {
+    def ensure: F[State[F, T]] = {
       io.map {
         case Some(t) => Already(t)
         case None => Except("not found")

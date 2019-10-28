@@ -26,7 +26,7 @@ object Example extends IOApp {
     }
   }
 
-  private def deepRun[A](f: IO[State[A]]): IO[_] = {
+  private def deepRun[A](f: IO[State[IO, A]]): IO[_] = {
     f.flatMap {
       case a@Already(t) => IO(println(a))
       case Except(err) => IO(println(err))
